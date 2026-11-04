@@ -1,4 +1,5 @@
 from pathlib import Path
+import io
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -33,6 +34,66 @@ def aggregate(signature):
     hourly = pd.concat(hours).groupby(level=0).sum().sort_index()
     station = pd.concat(stations).groupby(level=[0, 1]).sum().sort_values(ascending=False)
     return hourly, station, total, invalid, zero
+
+def merge_weather(hourly, weather):
+    required = {'datetime', 'temperature', 'rainfall'}
+    if not required.issubset(weather.columns):
+        raise ValueError('필수 열: datetime, temperature, rainfall')
+    weather = weather.copy()
+    dates = pd.to_datetime(weather['datetime'], errors='coerce')
+    if dates.isna().any():
+        raise ValueError('날씨 파일에 읽을 수 없는 날짜가 있습니다.')
+    if dates.dt.tz is not None:
+        raise ValueError('datetime은 시간대 표기 없는 한국 현지 시각으로 입력하세요.')
+    weather['시각'] = dates.dt.floor('h')
+    if weather['시각'].duplicated().any():
+        raise ValueError('날씨는 한 관측 기준으로 시간당 한 행만 입력하세요.')
+    for col in ['temperature', 'rainfall']:
+        weather[col] = pd.to_numeric(weather[col], errors='coerce').replace([float('inf'), -float('inf')], float('nan'))
+    return hourly.reset_index().merge(weather[['시각', 'temperature', 'rainfall']], on='시각', how='inner', validate='one_to_one')
+
+
+def read_weather(source):
+    raw = source.read_bytes() if isinstance(source, Path) else source.getvalue()
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        text = raw.decode('cp949')
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.strip().startswith(('날짜,', 'date,', 'datetime,'))), None)
+    if start is None:
+        raise ValueError('날짜, date 또는 datetime으로 시작하는 열 이름 행이 필요합니다.')
+    w = pd.read_csv(io.StringIO('\n'.join(lines[start:])), dtype=str)
+    w.columns = w.columns.str.strip()
+    w = w.rename(columns={'날짜': 'date', '평균기온(℃)': 'temperature', '최저기온(℃)': 'temperature_min', '최고기온(℃)': 'temperature_max', '일강수량(mm)': 'rainfall'})
+    key = 'date' if 'date' in w.columns else 'datetime'
+    w[key] = w[key].fillna('').str.strip()
+    w = w.loc[w[key] != ''].copy()
+    if 'temperature' not in w:
+        raise ValueError('평균기온(℃) 또는 temperature 열이 필요합니다.')
+    for col in ['temperature', 'temperature_min', 'temperature_max', 'rainfall']:
+        if col in w:
+            w[col] = pd.to_numeric(w[col], errors='coerce').replace([float('inf'), -float('inf')], float('nan'))
+    if 'rainfall' not in w:
+        w['rainfall'] = float('nan')
+    if key == 'date':
+        w['date'] = pd.to_datetime(w['date'], errors='coerce').dt.normalize()
+        if w['date'].isna().any() or w['date'].duplicated().any():
+            raise ValueError('일별 날씨 날짜가 잘못되었거나 중복입니다. 하루 한 행만 사용하세요.')
+    return w, key == 'date'
+
+
+def merge_daily(hourly, weather):
+    daily = hourly.groupby(hourly.index.normalize()).agg(건수=('건수', 'sum'), 관측시간수=('건수', 'size'))
+    daily.index.name = 'date'
+    return daily.reset_index().merge(weather, on='date', how='inner', validate='one_to_one')
+
+
+def rain_groups(merged):
+    rain = merged.loc[merged['rainfall'].notna() & (merged['rainfall'] >= 0)].copy()
+    rain['강수 여부'] = rain['rainfall'].gt(0).map({True: '비 옴', False: '비 안 옴'})
+    return rain
+
 
 st.title('🚲 따릉연구소')
 st.caption('따릉이 대여량은 정말 날씨와 시간대만으로 설명되는가?')
@@ -75,17 +136,21 @@ h['시간대'] = h.index.hour
 h['요일번호'] = h.index.dayofweek
 tabs = st.tabs(['시간·요일', '대여소', '날씨 비교', '해석·다운로드'])
 with tabs[0]:
-    daily = h.groupby(h.index.date)['건수'].sum().rename_axis('날짜').reset_index()
-    st.plotly_chart(px.line(daily, x='날짜', y='건수', markers=True, title='일별 대여 기록 수'), use_container_width=True)
-    metric = st.radio('시간대 비교 방식', ['관측 시간당 평균', '합계'], horizontal=True)
-    grouped = h.groupby('시간대')['건수']
-    by_hour = (grouped.mean() if metric == '관측 시간당 평균' else grouped.sum()).rename('대여량').reset_index()
-    st.plotly_chart(px.bar(by_hour, x='시간대', y='대여량', title=f'시간대별 {metric}'), use_container_width=True)
-    daily['요일'] = pd.to_datetime(daily['날짜']).dt.dayofweek
-    weekday = daily.groupby('요일')['건수'].mean().reindex(range(7))
-    weekday.index = ['월', '화', '수', '목', '금', '토', '일']
-    st.bar_chart(weekday.rename('관측일당 평균 대여량'))
-    st.caption('평균은 기록이 존재하는 시간·날짜를 분모로 계산합니다. 부분 업로드, 월초·월말의 불완전한 날짜, 누락 기록에 영향을 받습니다.')
+    st.subheader('① 시간대별 평균 대여량 · 막대그래프')
+    by_hour = h.groupby('시간대')['건수'].mean().reindex(range(24)).rename('평균 대여량').rename_axis('시간대').reset_index()
+    fig = px.bar(by_hour, x='시간대', y='평균 대여량', labels={'평균 대여량': '관측 시간당 평균 대여량(건)'})
+    fig.update_xaxes(dtick=1)
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption('각 시간대의 총 대여량을 그 시간대가 관측된 날짜 수로 나눕니다. 기록이 없는 시간은 0건으로 간주하지 않습니다.')
+    st.subheader('④ 요일 × 시간대 · 히트맵')
+    heat = h.pivot_table(index='요일번호', columns='시간대', values='건수', aggfunc='mean').reindex(index=range(7), columns=range(24))
+    heat.index = ['월', '화', '수', '목', '금', '토', '일']
+    fig = px.imshow(heat, aspect='auto', color_continuous_scale='YlGnBu',
+                    labels={'x': '시간대', 'y': '요일', 'color': '평균 대여량(건)'})
+    fig.update_xaxes(dtick=1)
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption('같은 요일·시간의 관측값을 평균합니다. 빈 칸은 관측 없음입니다. 같은 시간에도 평일과 주말의 이용 패턴이 다른지 살펴보세요.')
+    st.caption('두 그래프 모두 부분 업로드와 불완전한 시간 기록에 영향을 받습니다.')
 with tabs[1]:
     st.info('대여소 순위는 업로드된 전체 기간 기준입니다. 왼쪽 날짜 필터는 적용되지 않습니다.')
     n = st.slider('표시할 상위 대여소 수', 5, 50, 15)
@@ -94,33 +159,53 @@ with tabs[1]:
     st.plotly_chart(px.bar(top.sort_values('대여량'), x='대여량', y='대여소', orientation='h'), use_container_width=True)
     st.caption('대여량은 관측된 이용 건수입니다. 자전거 부족으로 발생한 미충족 수요나 재고량을 의미하지 않습니다.')
 with tabs[2]:
-    st.write('첨부된 대여 기록에는 날씨가 없습니다. 서울의 시간별 날씨 CSV를 추가하면 비교할 수 있습니다.')
-    st.code('datetime,temperature,rainfall\n2026-06-01 00:00:00,20.1,0')
-    st.caption('위 값은 형식 예시이며 실제 관측값이 아닙니다. datetime은 한국 시각, temperature는 ℃, rainfall은 해당 시간의 강수량(mm)으로 준비하세요.')
-    uploaded = st.file_uploader('시간별 날씨 CSV', type=['csv'])
-    if uploaded:
+    st.write('일별 기온 파일은 하루 총대여량과, 시간별 날씨 파일은 시간당 대여량과 비교합니다.')
+    uploaded = st.file_uploader('날씨 CSV (기상청 기온분석 원본도 지원)', type=['csv'])
+    weather_path = ROOT / 'data' / 'weather.csv'
+    source = uploaded if uploaded is not None else (weather_path if weather_path.is_file() else None)
+    if source is None:
+        st.info('data/weather.csv를 넣거나 위에서 날씨 파일을 올려주세요.')
+    else:
         try:
-            weather = pd.read_csv(uploaded, encoding='utf-8-sig')
-            required = {'datetime', 'temperature', 'rainfall'}
-            if not required.issubset(weather.columns):
-                raise ValueError('필수 열: datetime, temperature, rainfall')
-            weather['시각'] = pd.to_datetime(weather['datetime'], errors='coerce').dt.floor('h')
-            if weather['시각'].isna().any():
-                raise ValueError('날씨 파일에 읽을 수 없는 날짜가 있습니다.')
-            if weather['시각'].duplicated().any():
-                raise ValueError('같은 시간의 날씨가 여러 행입니다. 서울의 한 관측 기준으로 시간당 한 행만 남기세요.')
-            for col in ['temperature', 'rainfall']:
-                weather[col] = pd.to_numeric(weather[col], errors='coerce')
-            merged = h.reset_index().merge(weather[['시각', 'temperature', 'rainfall']], on='시각', how='inner')
-            st.write(f'시간이 일치하는 기록: {len(merged):,} / {len(h):,}시간')
-            feature = st.selectbox('날씨 변수', ['temperature', 'rainfall'])
-            valid = merged.dropna(subset=[feature, '건수'])
-            st.plotly_chart(px.scatter(valid, x=feature, y='건수', color='시간대', title='날씨와 시간별 대여량'), use_container_width=True)
-            if len(valid) >= 3 and valid[feature].nunique() > 1 and valid['건수'].nunique() > 1:
-                st.metric('피어슨 상관계수', f'{valid[feature].corr(valid["건수"]):.3f}')
+            weather, is_daily = read_weather(source)
+            if is_daily:
+                merged = merge_daily(h, weather)
+                st.write(f'날짜가 일치하는 기록: {len(merged)}일 / 날씨 {len(weather)}일')
+                incomplete = int((merged['관측시간수'] < 24).sum())
+                st.caption(f'24개 시간대가 관측되지 않은 날짜: {incomplete}일. 24시간이 있어도 분할 파일 전체의 완전성을 보장하지는 않습니다.')
+                if st.checkbox('24개 시간대가 관측된 날짜만 비교', value=True):
+                    merged = merged.loc[merged['관측시간수'] == 24].copy()
+                x_label, y_label, time_key, unit = '일평균기온(℃)', '하루 총대여량(건)', 'date', '일'
+                merged['요일'] = merged['date'].dt.dayofweek.map(dict(enumerate(['월','화','수','목','금','토','일'])))
+                color = '요일'
             else:
-                st.info('상관계수를 계산할 유효한 관측값이나 변동이 부족합니다.')
-            st.warning('이 그래프와 상관계수만으로 날씨의 인과효과나 “날씨·시간대만으로 충분하다”는 결론을 내릴 수 없습니다. 요일·계절·지역 등의 영향과 별도 기간 예측 성능을 함께 검토해야 합니다.')
+                merged = merge_weather(h, weather)
+                x_label, y_label, time_key, unit = '기온(℃)', '시간당 대여량(건)', '시각', '시간'
+                color = '시간대'
+                st.write(f'시간이 일치하는 기록: {len(merged)} / {len(h)}시간')
+            st.subheader('② 기온–대여량 · 산점도')
+            valid = merged.dropna(subset=['temperature', '건수'])
+            if valid.empty:
+                st.info('필터 조건을 만족하는 기온·대여량 쌍이 없습니다. 기간과 전체 데이터 업로드 여부를 확인하세요.')
+            else:
+                st.plotly_chart(px.scatter(valid, x='temperature', y='건수', color=color, hover_data=[time_key],
+                                           labels={'temperature': x_label, '건수': y_label}), use_container_width=True)
+                st.caption(f'점 하나는 1{unit}입니다. 유효 관측: {len(valid)}{unit}.')
+                if len(valid) >= 3 and valid['temperature'].nunique() > 1 and valid['건수'].nunique() > 1:
+                    st.write(f'피어슨 상관계수: {valid["temperature"].corr(valid["건수"]):.3f}')
+            st.subheader('③ 강수 여부별 대여량 · 상자그림')
+            rain = rain_groups(merged)
+            if rain.empty:
+                st.info('현재 자료에는 비교 가능한 강수량이 없습니다. 기온 파일만으로 비가 왔는지 알 수 없습니다. 일별 자료에는 같은 날짜의 일강수량(mm) 또는 rainfall 열을 추가하세요.')
+            else:
+                st.plotly_chart(px.box(rain, x='강수 여부', y='건수', color='강수 여부', points='outliers',
+                                       category_orders={'강수 여부': ['비 안 옴','비 옴']}, labels={'건수': y_label}), use_container_width=True)
+                st.dataframe(rain.groupby('강수 여부')['건수'].agg(['count','median','mean']).rename(columns={'count': f'관측 {unit} 수','median':'중앙값','mean':'평균'}))
+                st.caption('강수량 0mm는 비 안 옴, 0mm 초과는 비 옴입니다. 결측·음수는 제외합니다. 상자는 가운데 50%, 내부 선은 중앙값입니다.')
+                if rain['강수 여부'].nunique() < 2:
+                    st.info('한 범주만 존재해 두 집단 비교는 불가능합니다.')
+            st.warning('기온과 대여량의 상관관계는 인과관계를 뜻하지 않습니다. 요일 등의 영향을 함께 살펴보세요. 일평균기온을 시간별 관측기온으로 해석하지 않습니다.')
+            st.download_button('날씨 결합 자료 CSV', merged.to_csv(index=False).encode('utf-8-sig'), 'weather_joined.csv', 'text/csv')
         except Exception as e:
             st.error(f'날씨 파일 확인 필요: {e}')
 with tabs[3]:
