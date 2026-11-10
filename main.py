@@ -1,5 +1,6 @@
 from pathlib import Path
 import io
+from rain_loader import attach_rain
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -161,6 +162,7 @@ with tabs[1]:
 with tabs[2]:
     st.write('일별 기온 파일은 하루 총대여량과, 시간별 날씨 파일은 시간당 대여량과 비교합니다.')
     uploaded = st.file_uploader('날씨 CSV (기상청 기온분석 원본도 지원)', type=['csv'])
+    rain_upload = st.file_uploader('강수량 rn CSV (기온과 별도 업로드)', type=['csv'], key='rain_csv')
     weather_path = ROOT / 'data' / 'weather.csv'
     source = uploaded if uploaded is not None else (weather_path if weather_path.is_file() else None)
     if source is None:
@@ -168,6 +170,13 @@ with tabs[2]:
     else:
         try:
             weather, is_daily = read_weather(source)
+            st.caption(f'기온 파일: {source.name}')
+            if is_daily:
+                weather, rain_source = attach_rain(weather, ROOT, rain_upload)
+                st.caption(rain_source)
+                st.caption(f'결합 날씨 전체: {len(weather)}일 / 유효 강수량 {weather["rainfall"].notna().sum()}일 / 빈칸 {weather["rainfall"].isna().sum()}일')
+            elif rain_upload is not None:
+                st.warning('일별 rn 자료를 시간별 강수량으로 나눠 넣을 수 없습니다. 일별 기온 파일을 선택하세요.')
             if is_daily:
                 merged = merge_daily(h, weather)
                 st.write(f'날짜가 일치하는 기록: {len(merged)}일 / 날씨 {len(weather)}일')
