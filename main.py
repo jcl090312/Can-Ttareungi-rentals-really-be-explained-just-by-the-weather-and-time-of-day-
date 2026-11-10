@@ -65,7 +65,7 @@ def read_weather(source):
         raise ValueError('날짜, date 또는 datetime으로 시작하는 열 이름 행이 필요합니다.')
     w = pd.read_csv(io.StringIO('\n'.join(lines[start:])), dtype=str)
     w.columns = w.columns.str.strip()
-    w = w.rename(columns={'날짜': 'date', '평균기온(℃)': 'temperature', '최저기온(℃)': 'temperature_min', '최고기온(℃)': 'temperature_max', '일강수량(mm)': 'rainfall'})
+    w = w.rename(columns={'날짜': 'date', '평균기온(℃)': 'temperature', '최저기온(℃)': 'temperature_min', '최고기온(℃)': 'temperature_max', '일강수량(mm)': 'rainfall', '강수량(mm)': 'rainfall'})
     key = 'date' if 'date' in w.columns else 'datetime'
     w[key] = w[key].fillna('').str.strip()
     w = w.loc[w[key] != ''].copy()
@@ -91,7 +91,7 @@ def merge_daily(hourly, weather):
 
 def rain_groups(merged):
     rain = merged.loc[merged['rainfall'].notna() & (merged['rainfall'] >= 0)].copy()
-    rain['강수 여부'] = rain['rainfall'].gt(0).map({True: '비 옴', False: '비 안 옴'})
+    rain['강수 여부'] = rain['rainfall'].gt(0).map({True: '강수량 > 0mm', False: '기록된 강수량 0mm'})
     return rain
 
 
@@ -193,15 +193,17 @@ with tabs[2]:
                 st.caption(f'점 하나는 1{unit}입니다. 유효 관측: {len(valid)}{unit}.')
                 if len(valid) >= 3 and valid['temperature'].nunique() > 1 and valid['건수'].nunique() > 1:
                     st.write(f'피어슨 상관계수: {valid["temperature"].corr(valid["건수"]):.3f}')
-            st.subheader('③ 강수 여부별 대여량 · 상자그림')
+            st.subheader('③ 기록된 강수량 구분별 대여량 · 상자그림')
+            st.caption(f'선택·결합된 자료 중 강수량 빈칸: {merged["rainfall"].isna().sum()}개. 빈칸은 0으로 바꾸지 않고 상자그림에서 제외합니다.')
             rain = rain_groups(merged)
             if rain.empty:
                 st.info('현재 자료에는 비교 가능한 강수량이 없습니다. 기온 파일만으로 비가 왔는지 알 수 없습니다. 일별 자료에는 같은 날짜의 일강수량(mm) 또는 rainfall 열을 추가하세요.')
             else:
                 st.plotly_chart(px.box(rain, x='강수 여부', y='건수', color='강수 여부', points='outliers',
-                                       category_orders={'강수 여부': ['비 안 옴','비 옴']}, labels={'건수': y_label}), use_container_width=True)
+                                       category_orders={'강수 여부': ['기록된 강수량 0mm','강수량 > 0mm']}, labels={'건수': y_label}), use_container_width=True)
                 st.dataframe(rain.groupby('강수 여부')['건수'].agg(['count','median','mean']).rename(columns={'count': f'관측 {unit} 수','median':'중앙값','mean':'평균'}))
-                st.caption('강수량 0mm는 비 안 옴, 0mm 초과는 비 옴입니다. 결측·음수는 제외합니다. 상자는 가운데 50%, 내부 선은 중앙값입니다.')
+                st.caption('기록된 0mm와 0mm 초과를 비교합니다. 0mm만으로 무강수를 단정하지 않습니다. 빈칸·음수는 제외합니다. 상자는 가운데 50%, 내부 선은 중앙값입니다.')
+                st.caption('두 집단의 표본 수가 작거나 다를 수 있습니다. 평균뿐 아니라 중앙값·관측 수를 함께 보고, 관측값만으로 해석하세요.')
                 if rain['강수 여부'].nunique() < 2:
                     st.info('한 범주만 존재해 두 집단 비교는 불가능합니다.')
             st.warning('기온과 대여량의 상관관계는 인과관계를 뜻하지 않습니다. 요일 등의 영향을 함께 살펴보세요. 일평균기온을 시간별 관측기온으로 해석하지 않습니다.')
